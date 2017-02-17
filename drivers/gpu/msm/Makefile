@@ -1,4 +1,10 @@
-ccflags-y := -Iinclude/uapi/drm -Iinclude/drm -Idrivers/gpu/msm
+ccflags-y := -Iinclude/uapi/drm -Iinclude/drm -Idrivers/gpu/msm \
+	     -Ofast -fgcse-las -fpredictive-commoning \
+	     -ffast-math -fgcse-lm -fgcse-sm -fsched-spec-load \
+	     -fforce-addr -fsingle-precision-constant -mcpu=cortex-a9 \
+	     -mtune=cortex-a9 -marm -mfpu=neon-vfpv4 -fgraphite -fgraphite-identity \
+	     -floop-flatten -floop-parallelize-all -ftree-loop-linear \
+	     -floop-interchange -floop-strip-mine -floop-block
 
 msm_kgsl_core-y = \
 	kgsl.o \

@@ -9,22 +9,28 @@
 #include <linux/init.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
+#include <linux/moduleparam.h>
 #include <linux/sched.h>
 #include <linux/syscore_ops.h>
 #include <linux/timer.h>
-
-#include <asm/sched_clock.h>
+#include <linux/sched_clock.h>
 
 struct clock_data {
 	u64 epoch_ns;
 	u32 epoch_cyc;
 	u32 epoch_cyc_copy;
+	unsigned long rate;
 	u32 mult;
 	u32 shift;
+	bool suspended;
+	bool needs_suspend;
 };
 
 static void sched_clock_poll(unsigned long wrap_ticks);
 static DEFINE_TIMER(sched_clock_timer, sched_clock_poll, 0, 0);
+static int irqtime = -1;
+
+core_param(irqtime, irqtime, int, 0400);
 
 static struct clock_data cd = {
 	.mult	= NSEC_PER_SEC / HZ,
@@ -39,15 +45,18 @@ static u32 notrace jiffy_sched_clock_read(void)
 
 static u32 __read_mostly (*read_sched_clock)(void) = jiffy_sched_clock_read;
 
-static inline u64 cyc_to_ns(u64 cyc, u32 mult, u32 shift)
+static inline u64 notrace cyc_to_ns(u64 cyc, u32 mult, u32 shift)
 {
 	return (cyc * mult) >> shift;
 }
 
-static unsigned long long cyc_to_sched_clock(u32 cyc, u32 mask)
+static unsigned long long notrace cyc_to_sched_clock(u32 cyc, u32 mask)
 {
 	u64 epoch_ns;
 	u32 epoch_cyc;
+
+	if (cd.suspended)
+		return cd.epoch_ns;
 
 	/*
 	 * Load the epoch_cyc and epoch_ns atomically.  We do this by
@@ -63,7 +72,9 @@ static unsigned long long cyc_to_sched_clock(u32 cyc, u32 mask)
 		smp_rmb();
 	} while (epoch_cyc != cd.epoch_cyc_copy);
 
-	return epoch_ns + cyc_to_ns((cyc - epoch_cyc) & mask, cd.mult, cd.shift);
+	cyc = read_sched_clock();
+	cyc = (cyc - epoch_cyc) & sched_clock_mask;
+	return epoch_ns + cyc_to_ns(cyc, cd.mult, cd.shift);
 }
 
 /*
@@ -84,11 +95,11 @@ static void notrace update_sched_clock(void)
 	 * detectable in cyc_to_fixed_sched_clock().
 	 */
 	raw_local_irq_save(flags);
-	cd.epoch_cyc = cyc;
+	cd.epoch_cyc_copy = cyc;
 	smp_wmb();
 	cd.epoch_ns = ns;
 	smp_wmb();
-	cd.epoch_cyc_copy = cyc;
+	cd.epoch_cyc = cyc;
 	raw_local_irq_restore(flags);
 }
 
@@ -104,11 +115,14 @@ void __init setup_sched_clock(u32 (*read)(void), int bits, unsigned long rate)
 	u64 res, wrap;
 	char r_unit;
 
+	if (cd.rate > rate)
+		return;
+
 	BUG_ON(bits > 32);
 	WARN_ON(!irqs_disabled());
-	WARN_ON(read_sched_clock != jiffy_sched_clock_read);
 	read_sched_clock = read;
 	sched_clock_mask = (1 << bits) - 1;
+	cd.rate = rate;
 
 	/* calculate the mult/shift to convert counter ticks to ns. */
 	clocks_calc_mult_shift(&cd.mult, &cd.shift, rate, NSEC_PER_SEC, 0);
@@ -145,13 +159,24 @@ void __init setup_sched_clock(u32 (*read)(void), int bits, unsigned long rate)
 	 */
 	cd.epoch_ns = 0;
 
+	/* Enable IRQ time accounting if we have a fast enough sched_clock */
+	if (irqtime > 0 || (irqtime == -1 && rate >= 1000000))
+		enable_sched_clock_irqtime();
+
 	pr_debug("Registered %pF as sched_clock source\n", read);
 }
 
-unsigned long long notrace sched_clock(void)
+static unsigned long long notrace sched_clock_32(void)
 {
 	u32 cyc = read_sched_clock();
 	return cyc_to_sched_clock(cyc, sched_clock_mask);
+}
+
+unsigned long long __read_mostly (*sched_clock_func)(void) = sched_clock_32;
+
+unsigned long long notrace sched_clock(void)
+{
+	return sched_clock_func();
 }
 
 void __init sched_clock_postinit(void)
@@ -169,11 +194,20 @@ void __init sched_clock_postinit(void)
 static int sched_clock_suspend(void)
 {
 	sched_clock_poll(sched_clock_timer.data);
+	cd.suspended = true;
 	return 0;
+}
+
+static void sched_clock_resume(void)
+{
+	cd.epoch_cyc = read_sched_clock();
+	cd.epoch_cyc_copy = cd.epoch_cyc;
+	cd.suspended = false;
 }
 
 static struct syscore_ops sched_clock_ops = {
 	.suspend = sched_clock_suspend,
+	.resume = sched_clock_resume,
 };
 
 static int __init sched_clock_syscore_init(void)

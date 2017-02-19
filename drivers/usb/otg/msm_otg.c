@@ -93,6 +93,10 @@ static struct workqueue_struct *msm_otg_id_pin_wq;
 static int global_vbus_suspend_status;
 static int global_id_pin_suspend_status;
 
+/* otg+charge: sysfs entry */
+static bool usbhost_charge_mode = false;
+module_param(usbhost_charge_mode, bool, 0755);
+
 /* APQ8064 GPIO pin definition */
 #define APQ_AP_ACOK	23
 #define APQ_OTG_ID_PIN	77
@@ -158,6 +162,9 @@ static void asus_chg_set_chg_mode(enum usb_chg_type chg_src)
 		printk(KERN_INFO "The USB cable status = CHARGER_CDP\n");
 		break;
 	case USB_ACA_A_CHARGER:
+		usb_cable_type_detect(CHARGER_ACA);
+		printk(KERN_INFO "The USB cable status = CHARGER_ACA\n");
+		break;
 	case USB_ACA_B_CHARGER:
 	case USB_ACA_C_CHARGER:
 	case USB_ACA_DOCK_CHARGER:
@@ -1131,7 +1138,7 @@ static int msm_otg_notify_host_mode(struct msm_otg *motg, bool host_mode)
 	if (!psy)
 		goto psy_not_supported;
 
-	if (host_mode) {
+	if (host_mode && !usbhost_charge_mode) {
 		ret = power_supply_set_scope(psy, POWER_SUPPLY_SCOPE_SYSTEM);
 	} else {
 		ret = power_supply_set_scope(psy, POWER_SUPPLY_SCOPE_DEVICE);
@@ -1267,7 +1274,10 @@ static void msm_otg_start_host(struct usb_otg *otg, int on)
 
 	if (on) {
 		dev_dbg(otg->phy->dev, "host on\n");
-		smb345_otg_status(true);
+		if (usbhost_charge_mode)
+			smb345_otg_status(false);
+		else
+			smb345_otg_status(true);
 		otg_host_on = 1;
 
 		// Reset to apply new parameter for host.
@@ -1382,6 +1392,12 @@ static void msm_hsusb_vbus_power(struct msm_otg *motg, bool on)
 {
 	int ret;
 	static bool vbus_is_on;
+
+	if (usbhost_charge_mode) {
+		printk("[usbhost_charge_mode]: Do not supply power in host mode\n");
+		msm_otg_notify_host_mode(motg, on);
+		return;
+	}
 
 	if (vbus_is_on == on)
 		return;
@@ -2244,10 +2260,14 @@ static void msm_chg_detect_work(struct work_struct *w)
 				break;
 			}
 
-			if (line_state) /* DP > VLGC or/and DM > VLGC */
-				motg->chg_type = USB_PROPRIETARY_CHARGER;
-			else
+			if (line_state) {
+				if (usbhost_charge_mode)
+					motg->chg_type = USB_ACA_A_CHARGER;
+				else
+					motg->chg_type = USB_PROPRIETARY_CHARGER;
+			} else {
 				motg->chg_type = USB_SDP_CHARGER;
+			}
 
 			motg->chg_state = USB_CHG_STATE_DETECTED;
 			delay = 0;
@@ -2753,6 +2773,14 @@ static void msm_otg_sm_work(struct work_struct *w)
 		} else if (test_bit(ID_A, &motg->inputs)) {
 			msm_hsusb_vbus_power(motg, 0);
 		} else if (!test_bit(A_BUS_REQ, &motg->inputs)) {
+			if (usbhost_charge_mode) {
+				if (test_bit(B_SESS_VLD, &motg->inputs)) {
+					pr_debug("b_sess_vld\n");
+					usleep_range(10000, 12000);
+					if (motg->chg_state == USB_CHG_STATE_UNDEFINED)
+						msm_chg_detect_work(&motg->chg_work.work);
+				}
+			}
 			/*
 			 * If TA_WAIT_BCON is infinite, we don;t
 			 * turn off VBUS. Enter low power mode.
@@ -3108,15 +3136,30 @@ static void msm_otg_set_vbus_state(int online)
 	struct usb_otg *otg = motg->phy.otg;
 
 	/* In A Host Mode, ignore received BSV interrupts */
-	if (otg->phy->state >= OTG_STATE_A_IDLE)
+	if (!usbhost_charge_mode && otg->phy->state >= OTG_STATE_A_IDLE)
 		return;
 
 	if (online) {
 		pr_debug("PMIC: BSV set\n");
 		set_bit(B_SESS_VLD, &motg->inputs);
+		if (usbhost_charge_mode && otg->phy->state >= OTG_STATE_A_IDLE) {
+			printk("[usbhost_charge_mode]: already in host mode, restart chg_work");
+			msm_chg_detect_work(&motg->chg_work.work);
+		}
 	} else {
 		pr_debug("PMIC: BSV clear\n");
 		clear_bit(B_SESS_VLD, &motg->inputs);
+		if (otg->phy->state >= OTG_STATE_A_IDLE && usbhost_charge_mode) {
+			printk("[usbhost_charge_mode]: chg_work cancel from set vbus state");
+			cancel_delayed_work_sync(&motg->chg_work);
+
+			motg->chg_state = USB_CHG_STATE_UNDEFINED;
+			motg->chg_type = USB_INVALID_CHARGER;
+
+			asus_chg_set_chg_mode(USB_INVALID_CHARGER);
+
+			msm_otg_notify_charger(motg, 0);
+		}
 	}
 
 	if (!init) {
@@ -3162,6 +3205,8 @@ static void id_pin_irq_work_function(struct work_struct *work)
 	else {
 		pr_debug("%s: gpio_get_value(APQ_OTG_ID_PIN) = %d\n", __func__, gpio_get_value(APQ_OTG_ID_PIN));
 		if (gpio == 0 && otg_host_on == 0) {
+			if (usbhost_charge_mode)
+				msleep(40);
 			pr_info("%s: APQ_OTG_ID_PIN is low : Host mode\n", __func__);
 			set_bit(A_BUS_REQ, &motg->inputs);
 			clear_bit(ID, &motg->inputs);

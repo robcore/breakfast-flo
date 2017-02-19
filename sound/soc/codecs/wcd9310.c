@@ -42,6 +42,15 @@ static int cfilt_adjust_ms = 10;
 module_param(cfilt_adjust_ms, int, 0644);
 MODULE_PARM_DESC(cfilt_adjust_ms, "delay after adjusting cfilt voltage in ms");
 
+/* Sound control support */
+extern int snd_ctrl_enabled;
+extern int snd_reg_access(unsigned int);
+extern void snd_cache_write(unsigned int, unsigned int);
+extern unsigned int snd_cache_read(unsigned int);
+
+struct snd_soc_codec *snd_engine_codec_ptr;
+EXPORT_SYMBOL(snd_engine_codec_ptr);
+
 #define WCD9310_RATES (SNDRV_PCM_RATE_8000 | SNDRV_PCM_RATE_16000 |\
 			SNDRV_PCM_RATE_32000 | SNDRV_PCM_RATE_48000 |\
 			SNDRV_PCM_RATE_96000 | SNDRV_PCM_RATE_192000)
@@ -3936,7 +3945,7 @@ static int tabla_volatile(struct snd_soc_codec *ssc, unsigned int reg)
 }
 
 #define TABLA_FORMATS (SNDRV_PCM_FMTBIT_S16_LE)
-static int tabla_write(struct snd_soc_codec *codec, unsigned int reg,
+int tabla_write(struct snd_soc_codec *codec, unsigned int reg,
 	unsigned int value)
 {
 	int ret;
@@ -3949,9 +3958,21 @@ static int tabla_write(struct snd_soc_codec *codec, unsigned int reg,
 				reg, ret);
 	}
 
+	if (!snd_ctrl_enabled)
+		return wcd9xxx_reg_write(codec->control_data, reg, value);
+
+	if (snd_reg_access(reg)) {
+		snd_cache_write(reg, value);
+	} else {
+		if (snd_cache_read(reg) != -1)
+			value = snd_cache_read(reg);
+	}
+
 	return wcd9xxx_reg_write(codec->control_data, reg, value);
 }
-static unsigned int tabla_read(struct snd_soc_codec *codec,
+EXPORT_SYMBOL(tabla_write);
+
+unsigned int tabla_read(struct snd_soc_codec *codec,
 				unsigned int reg)
 {
 	unsigned int val;
@@ -3972,6 +3993,7 @@ static unsigned int tabla_read(struct snd_soc_codec *codec,
 	val = wcd9xxx_reg_read(codec->control_data, reg);
 	return val;
 }
+EXPORT_SYMBOL(tabla_read);
 
 static s16 tabla_get_current_v_ins(struct tabla_priv *tabla, bool hu)
 {
@@ -8416,6 +8438,9 @@ static int tabla_codec_probe(struct snd_soc_codec *codec)
 	int ret = 0;
 	int i;
 	int ch_cnt;
+
+	pr_info("tabla codec probe...\n");
+	snd_engine_codec_ptr = codec;
 
 	codec->control_data = dev_get_drvdata(codec->dev->parent);
 	control = codec->control_data;

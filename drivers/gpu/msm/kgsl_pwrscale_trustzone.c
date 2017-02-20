@@ -38,6 +38,17 @@ spinlock_t tz_lock;
  * per frame for 60fps content.
  */
 #define FLOOR			5000
+/*
+ * MIN_BUSY is 1 msec for the sample to be sent
+ */
+#define MIN_BUSY		1000
+/*
+ * Use BUSY_BIN to check for fully busy rendering
+ * intervals that may need early intervention when
+ * seen with LONG_FRAME lengths
+ */
+#define BUSY_BIN		95
+#define LONG_FRAME		25000
 /* CEILING is 50msec, larger than any standard
  * frame length, but less than the idle timer.
  */
@@ -144,6 +155,7 @@ static void tz_idle(struct kgsl_device *device, struct kgsl_pwrscale *pwrscale)
 	struct tz_priv *priv = pwrscale->priv;
 	struct kgsl_power_stats stats;
 	int val, idle;
+	static int busy_bin, frame_flag;
 
 	/* In "performance" mode the clock speed always stays
 	   the same */
@@ -158,14 +170,27 @@ static void tz_idle(struct kgsl_device *device, struct kgsl_pwrscale *pwrscale)
 	 * has passed since the last run.
 	 */
 	if ((stats.total_time == 0) ||
-		(priv->bin.total_time < FLOOR))
+		(priv->bin.total_time < FLOOR) ||
+		(unsigned int) priv->bin.busy_time < MIN_BUSY)
 		return;
+
+	if (((u32) (stats.busy_time * 100) / (u32) stats.total_time) > BUSY_BIN) {
+		busy_bin += stats.busy_time;
+		if (stats.total_time > LONG_FRAME)
+			frame_flag = 1;
+	} else {
+		busy_bin = 0;
+		frame_flag = 0;
+	}
 
 	/* If there is an extended block of busy processing, set
 	 * frequency to turbo.  Otherwise run the normal algorithm.
 	 */
-	if (priv->bin.busy_time > CEILING) {
+	if (priv->bin.busy_time > CEILING ||
+		(busy_bin > CEILING && frame_flag)) {
 		val = 0;
+		busy_bin = 0;
+		frame_flag = 0;
 		kgsl_pwrctrl_pwrlevel_change(device,
 				KGSL_PWRLEVEL_TURBO);
 	} else if (priv->idle_dcvs) {

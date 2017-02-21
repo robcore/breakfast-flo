@@ -18,6 +18,11 @@
 #include <linux/backing-dev.h>
 #include "internal.h"
 
+#ifdef CONFIG_DYNAMIC_FSYNC
+extern bool suspended;
+extern bool dfs_active;
+#endif
+
 bool fsync_enabled = true;
 module_param(fsync_enabled, bool, 0755);
 
@@ -90,10 +95,16 @@ static void sync_one_sb(struct super_block *sb, void *arg)
  * Sync all the data for all the filesystems (called by sys_sync() and
  * emergency sync)
  */
-static void sync_filesystems(int wait)
+#ifndef CONFIG_DYNAMIC_FSYNC
+static
+#endif
+void sync_filesystems(int wait)
 {
 	iterate_supers(sync_one_sb, &wait);
 }
+#ifdef CONFIG_DYNAMIC_FSYNC
+EXPORT_SYMBOL_GPL(sync_filesystems);
+#endif
 
 /*
  * sync everything.  Start out by waking pdflush, because that writes back
@@ -145,6 +156,11 @@ SYSCALL_DEFINE1(syncfs, int, fd)
 	if (!fsync_enabled)
 		return 0;
 
+#ifdef CONFIG_DYNAMIC_FSYNC
+	if (dfs_active && !suspended)
+		return 0;
+#endif
+
 	file = fget_light(fd, &fput_needed);
 	if (!file)
 		return -EBADF;
@@ -174,6 +190,11 @@ int vfs_fsync_range(struct file *file, loff_t start, loff_t end, int datasync)
 	if (!fsync_enabled)
 		return 0;
 
+#ifdef CONFIG_DYNAMIC_FSYNC
+	if (dfs_active && !suspended)
+		return 0;
+#endif
+
 	if (!file->f_op || !file->f_op->fsync)
 		return -EINVAL;
 	return file->f_op->fsync(file, start, end, datasync);
@@ -193,6 +214,11 @@ int vfs_fsync(struct file *file, int datasync)
 	if (!fsync_enabled)
 		return 0;
 
+#ifdef CONFIG_DYNAMIC_FSYNC
+	if (dfs_active && !suspended)
+		return 0;
+#endif
+
 	return vfs_fsync_range(file, 0, LLONG_MAX, datasync);
 }
 EXPORT_SYMBOL(vfs_fsync);
@@ -204,6 +230,11 @@ static int do_fsync(unsigned int fd, int datasync)
 
 	if (!fsync_enabled)
 		return 0;
+
+#ifdef CONFIG_DYNAMIC_FSYNC
+	if (dfs_active && !suspended)
+		return 0;
+#endif
 
 	file = fget(fd);
 	if (file) {
@@ -218,6 +249,11 @@ SYSCALL_DEFINE1(fsync, unsigned int, fd)
 	if (!fsync_enabled)
 		return 0;
 
+#ifdef CONFIG_DYNAMIC_FSYNC
+	if (dfs_active && !suspended)
+		return 0;
+#endif
+
 	return do_fsync(fd, 0);
 }
 
@@ -225,6 +261,11 @@ SYSCALL_DEFINE1(fdatasync, unsigned int, fd)
 {
 	if (!fsync_enabled)
 		return 0;
+
+#ifdef CONFIG_DYNAMIC_FSYNC
+	if (dfs_active && !suspended)
+		return 0;
+#endif
 
 	return do_fsync(fd, 1);
 }
@@ -241,6 +282,11 @@ int generic_write_sync(struct file *file, loff_t pos, loff_t count)
 {
 	if (!fsync_enabled)
 		return 0;
+
+#ifdef CONFIG_DYNAMIC_FSYNC
+	if (dfs_active && !suspended)
+		return 0;
+#endif
 
 	if (!(file->f_flags & O_DSYNC) && !IS_SYNC(file->f_mapping->host))
 		return 0;
@@ -308,6 +354,11 @@ SYSCALL_DEFINE(sync_file_range)(int fd, loff_t offset, loff_t nbytes,
 
 	if (!fsync_enabled)
 		return 0;
+
+#ifdef CONFIG_DYNAMIC_FSYNC
+	if (dfs_active && !suspended)
+		return 0;
+#endif
 
 	ret = -EINVAL;
 	if (flags & ~VALID_FLAGS)
